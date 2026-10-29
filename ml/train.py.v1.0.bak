@@ -1,0 +1,79 @@
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+import joblib
+import json
+
+INPUT_FILE = "dataset/processed/features.csv"
+MODEL_FILE = "model/isolation_forest.pkl"
+STATS_FILE = "model/anomaly_score_stats.json"
+METADATA_FILE = "model/model_metadata.json"
+
+
+def train_model():
+
+    # Load features
+    df = pd.read_csv(INPUT_FILE)
+
+    # Feature names used by the model
+    feature_columns = list(df.columns)
+
+    # Create Isolation Forest
+    model = IsolationForest(
+        n_estimators=100,
+        contamination=0.2,
+        random_state=42
+    )
+
+    # Train model
+    model.fit(df)
+
+    # Calculate anomaly scores
+    anomaly_scores = model.decision_function(df)
+
+    # Save score statistics
+    score_stats = {
+        "min_score": float(anomaly_scores.min()),
+        "max_score": float(anomaly_scores.max())
+    }
+
+    # Save model
+    joblib.dump(model, MODEL_FILE)
+
+    # Save score statistics
+    with open(STATS_FILE, "w") as file:
+        json.dump(score_stats, file, indent=4)
+
+    # Save model metadata
+    metadata = {
+        "model": "Isolation Forest",
+        "n_estimators": 100,
+        "contamination": 0.2,
+        "number_of_samples": len(df),
+        "number_of_features": len(feature_columns),
+        "features": feature_columns
+    }
+
+    with open(METADATA_FILE, "w") as file:
+        json.dump(metadata, file, indent=4)
+
+    print("Isolation Forest model trained successfully!")
+
+    print("Number of samples:", len(df))
+    print("Number of features:", len(df.columns))
+    print("Contamination:", 0.2)
+
+    print("\nFeatures used:")
+    for feature in feature_columns:
+        print("-", feature)
+
+    print("\nAnomaly score statistics:")
+    print("Minimum score:", score_stats["min_score"])
+    print("Maximum score:", score_stats["max_score"])
+
+    print("\nModel saved to:", MODEL_FILE)
+    print("Score statistics saved to:", STATS_FILE)
+    print("Model metadata saved to:", METADATA_FILE)
+
+
+if __name__ == "__main__":
+    train_model()

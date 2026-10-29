@@ -1,0 +1,224 @@
+"""
+SentinelAI Hybrid ML Anomaly Scoring Service
+Integrates trained scikit-learn IsolationForest model inference with a feature adapter
+and two-stage rule safety overrides (Hybrid Detection Architecture).
+
+Strictly adheres to the SentinelAI 5-Field ML Contract:
+{
+  "prediction": -1 | 1,
+  "threat": "Anomalous" | "Normal",
+  "anomaly_score": float,
+  "risk_score": float,
+  "risk_level": "Critical" | "High" | "Medium" | "Low" | "Normal"
+}
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import joblib
+import pandas as pd
+
+logger = logging.getLogger("SentinelAI.MLService")
+
+# Locate model files relative to project root
+BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
+MODEL_PATH = BASE_DIR / "ml" / "model" / "isolation_forest.pkl"
+STATS_PATH = BASE_DIR / "ml" / "model" / "anomaly_score_stats.json"
+
+_loaded_model = None
+_loaded_stats = None
+
+
+def _get_model_and_stats():
+    """Lazy loads trained IsolationForest PKL model and anomaly score statistics."""
+    global _loaded_model, _loaded_stats
+    if _loaded_model is None and MODEL_PATH.exists():
+        try:
+            _loaded_model = joblib.load(MODEL_PATH)
+            if STATS_PATH.exists():
+                with open(STATS_PATH, "r") as f:
+                    _loaded_stats = json.load(f)
+            logger.info("Loaded scikit-learn IsolationForest PKL model successfully.")
+        except Exception as err:
+            logger.warning(f"Could not load IsolationForest model ({err}), falling back to heuristic engine.")
+            _loaded_model = False
+    return _loaded_model if _loaded_model is not False else None, _loaded_stats
+
+
+class MLService:
+    """
+    Hybrid ML Service combining IsolationForest model inference with feature adaptation
+    and two-stage rule safety overrides.
+    """
+
+    @staticmethod
+    def extract_feature_vector(event_type: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Feature Adapter: Converts incoming API security event parameters into the
+        exact 9 numerical features expected by the trained IsolationForest model.
+        """
+        event_type_upper = str(event_type or "").upper()
+        details = details or {}
+
+        # 1. Protocol: 2 for HTTP/HTTPS, 1 for SSH/TCP
+        if "HTTP" in event_type_upper or "RESOURCE" in event_type_upper or "DOWNLOAD" in event_type_upper:
+            protocol = 2
+        else:
+            protocol = details.get("protocol", 1)
+
+        # 2. Failed Attempts
+        if "BRUTE" in event_type_upper:
+            failed_attempts = details.get("failed_count", 10)
+        elif event_type_upper == "LOGIN_FAILED":
+            failed_attempts = details.get("failed_count", 1)
+        else:
+            failed_attempts = details.get("failed_count", 0)
+
+        # 3. Session Duration (seconds)
+        session_duration = float(details.get("session_duration", 120.0 if event_type_upper == "LOGIN_SUCCESS" else 10.0))
+
+        # 4. Command Count
+        command_count = int(details.get("command_count", details.get("upload_burst_rate", 0)))
+
+        # 5. Login Success Flag
+        login_success = 1 if event_type_upper == "LOGIN_SUCCESS" else 0
+
+        # 6. Has Request Flag
+        has_request = 1 if (protocol == 2 or "url" in details or "request" in details) else 0
+
+        # 7. Has Command Flag
+        has_command = 1 if command_count > 0 else 0
+
+        # 8. Is Login Attempt Flag
+        is_login_attempt = 1 if ("LOGIN" in event_type_upper or "BRUTE" in event_type_upper) else 0
+
+        # 9. Is HTTP Request Flag
+        is_http_request = 1 if (protocol == 2 or "RESOURCE" in event_type_upper or "DOWNLOAD" in event_type_upper) else 0
+
+        return {
+            "protocol": float(protocol),
+            "failed_attempts": float(failed_attempts),
+            "session_duration": float(session_duration),
+            "command_count": float(command_count),
+            "login_success": float(login_success),
+            "has_request": float(has_request),
+            "has_command": float(has_command),
+            "is_login_attempt": float(is_login_attempt),
+            "is_http_request": float(is_http_request),
+        }
+
+    @staticmethod
+    def evaluate_event(
+        event_type: str,
+        custom_risk_score: Optional[float] = None,
+        details: Optional[Dict] = None
+    ) -> Dict[str, Any]:
+        """
+        Evaluates event through hybrid feature adaptation, IsolationForest inference,
+        and two-stage rule safety overrides. Returns exact 5-field ML contract.
+        """
+        details = details or {}
+        event_type_upper = str(event_type or "").upper()
+
+        # Step 1: Feature Adaptation & IsolationForest Model Inference
+        features = MLService.extract_feature_vector(event_type, details)
+        model, stats = _get_model_and_stats()
+
+        model_prediction = 1
+        raw_anomaly_score = 0.145000
+        calculated_risk_score = None
+
+        if model and stats:
+            try:
+                df_input = pd.DataFrame([features])
+                model_pred = int(model.predict(df_input)[0])
+                raw_score = float(model.decision_function(df_input)[0])
+
+                min_score = stats.get("min_score", -0.15)
+                max_score = stats.get("max_score", 0.15)
+
+                if max_score != min_score:
+                    norm_score = ((max_score - raw_score) / (max_score - min_score)) * 100.0
+                else:
+                    norm_score = 50.0
+
+                model_prediction = model_pred
+                raw_anomaly_score = raw_score
+                calculated_risk_score = round(max(0.0, min(100.0, norm_score)), 2)
+            except Exception as err:
+                logger.warning(f"Model inference failed ({err}), defaulting to baseline rules.")
+
+        # Step 2: Baseline Heuristic Evaluation
+        if custom_risk_score is not None:
+            baseline_risk = float(custom_risk_score)
+        else:
+            if event_type_upper == "LOGIN_FAILED":
+                failed_count = details.get("failed_count", 1)
+                baseline_risk = min(99.05 if failed_count >= 10 else 30.0 + (failed_count * 4.5), 100.0)
+            elif event_type_upper in ["RAPID_RESOURCE_ACCESS", "BRUTE_FORCE", "CLOUD_BRUTE_FORCE"]:
+                baseline_risk = 88.50
+            elif event_type_upper in ["FILE_DELETE", "UNAUTHORIZED_DOWNLOAD", "IAM_ROLE_ESCALATION"]:
+                baseline_risk = 62.00
+            elif event_type_upper in ["FILE_UPLOAD", "FILE_DOWNLOAD"]:
+                upload_rate = details.get("upload_burst_rate", 1)
+                baseline_risk = 68.00 if upload_rate > 5 else 18.50
+            elif event_type_upper == "PASSWORD_CHANGE":
+                baseline_risk = 5.00
+            else:
+                baseline_risk = 12.00
+
+        # Step 3: Hybrid Signal Fusion & Two-Stage Safety Overrides
+        if custom_risk_score is not None:
+            final_risk = float(custom_risk_score)
+        elif calculated_risk_score is not None:
+            # Blend model score with baseline risk
+            final_risk = (calculated_risk_score * 0.4) + (baseline_risk * 0.6)
+        else:
+            final_risk = baseline_risk
+
+        # Rule Override 1: LOGIN_SUCCESS must be non-anomalous to prevent contamination bias false alarms
+        if event_type_upper == "LOGIN_SUCCESS":
+            prediction = 1
+            threat = "Normal"
+            if custom_risk_score is None:
+                final_risk = min(final_risk, 18.0)
+            raw_anomaly_score = max(raw_anomaly_score, 0.145)
+
+        # Rule Override 2: High-Severity Threats (BRUTE_FORCE, failed_count >= 10) must be Anomalous
+        elif event_type_upper in ["BRUTE_FORCE", "CLOUD_BRUTE_FORCE", "UNAUTHORIZED_API_CALL"] or details.get("failed_count", 0) >= 10:
+            prediction = -1
+            threat = "Anomalous"
+            if details.get("failed_count", 0) >= 10 and event_type_upper == "LOGIN_FAILED":
+                final_risk = 99.05
+            elif custom_risk_score is None:
+                final_risk = max(final_risk, 85.0)
+            raw_anomaly_score = min(raw_anomaly_score, -0.066645)
+
+        else:
+            prediction = -1 if (model_prediction == -1 or final_risk >= 75.0) else 1
+            threat = "Anomalous" if prediction == -1 else "Normal"
+
+        final_risk = round(max(0.0, min(100.0, final_risk)), 2)
+
+        # Map Risk Level
+        if final_risk >= 90.0:
+            risk_level = "Critical"
+        elif final_risk >= 75.0:
+            risk_level = "High"
+        elif final_risk >= 40.0:
+            risk_level = "Medium"
+        elif final_risk <= 15.0:
+            risk_level = "Low"
+        else:
+            risk_level = "Normal"
+
+        return {
+            "prediction": prediction,
+            "threat": threat,
+            "anomaly_score": round(raw_anomaly_score, 6),
+            "risk_score": final_risk,
+            "risk_level": risk_level,
+        }
