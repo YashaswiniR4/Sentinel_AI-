@@ -191,8 +191,13 @@ class MLService:
         else:
             is_http_event = 0.0
 
-        # 9. Transfer Burst Rate: Single source field details.upload_burst_rate
-        transfer_burst_rate = _safe_float(details.get("upload_burst_rate"), 0.0)
+        # 9. Transfer Burst Rate: Observed metadata precedence (accepts transfer_burst_rate OR upload_burst_rate)
+        transfer_burst_rate = _safe_float(
+            details.get("transfer_burst_rate", details.get("upload_burst_rate")), 0.0
+        )
+        # Also infer from event type if not explicitly provided
+        if transfer_burst_rate == 0.0 and any(k in event_type_upper for k in ["EXFIL", "DOWNLOAD", "UPLOAD"]):
+            transfer_burst_rate = _safe_float(details.get("bytes_transferred", 0.0), 0.0) / 1e6  # Convert bytes to MB
 
         # 10. Endpoint Risk Depth: URL path & query string sensitivity check (SQL/XSS/Admin detection)
         url_raw = str(details.get("url", details.get("request", details.get("path", ""))))
@@ -206,15 +211,20 @@ class MLService:
         ]
         admin_patterns = ["/admin", "/config", "/graphql", "/export", "/internal", "/debug"]
 
-        if any(pat in full_payload_str for pat in sql_xss_patterns) or any(sens in full_payload_str for sens in admin_patterns):
+        # 10. Endpoint Risk Depth: Observed metadata precedence; fallback to URL pattern analysis
+        if "endpoint_risk_depth" in details:
+            endpoint_risk_depth = float(max(0.0, min(1.0, _safe_float(details["endpoint_risk_depth"], 0.1))))
+        elif any(pat in full_payload_str for pat in sql_xss_patterns) or any(sens in full_payload_str for sens in admin_patterns):
             endpoint_risk_depth = 0.9
         elif url_raw and url_raw != "/":
             endpoint_risk_depth = 0.4
         else:
             endpoint_risk_depth = 0.1
 
-        # 11. Action Destructiveness: Structural severity
-        if any(k in event_type_upper for k in ["DELETE", "ESCALATION", "EXFIL", "DROP"]):
+        # 11. Action Destructiveness: Observed metadata precedence; fallback to structural severity
+        if "action_destructiveness" in details:
+            action_destructiveness = float(max(0.0, min(1.0, _safe_float(details["action_destructiveness"], 0.0))))
+        elif any(k in event_type_upper for k in ["DELETE", "ESCALATION", "EXFIL", "DROP", "TAMPER"]):
             action_destructiveness = 0.8
         elif any(k in event_type_upper for k in ["DOWNLOAD", "UPLOAD"]):
             action_destructiveness = 0.4
@@ -321,6 +331,27 @@ class MLService:
                 baseline_risk = 68.00 if upload_rate > 10 else 18.50
             elif event_type_upper == "PASSWORD_CHANGE":
                 baseline_risk = 5.00
+            # ── Scenario-specific baseline rules (RULE_BASED detection) ──────────────
+            elif event_type_upper == "PORT_SCAN":
+                # Port scanning: always at least ALERT tier
+                baseline_risk = 60.00
+            elif event_type_upper == "DATA_EXFILTRATION":
+                burst = features.get("transfer_burst_rate", 0.0)
+                # High burst rate = critical; any exfiltration attempt = at least high
+                baseline_risk = 90.00 if burst > 50 else 78.00
+            elif event_type_upper == "SQL_INJECTION_ATTEMPT":
+                baseline_risk = 85.00
+            elif event_type_upper == "PATH_TRAVERSAL_ATTEMPT":
+                baseline_risk = 80.00
+            elif event_type_upper == "AUDIT_LOG_TAMPERING":
+                # Insider threat — highest priority
+                baseline_risk = 92.00
+            elif event_type_upper in ["CLOUD_CONFIG_CHANGE", "CLOUD_IAM_CHANGE", "CLOUD_FIREWALL_CHANGE"]:
+                destructiveness = features.get("action_destructiveness", 0.0)
+                baseline_risk = 85.00 if destructiveness >= 0.8 else 52.00
+            elif event_type_upper == "CREDENTIAL_STUFFING":
+                baseline_risk = 88.00
+            # ─────────────────────────────────────────────────────────────────────────
             elif features.get("command_count", 0.0) >= 20.0:
                 baseline_risk = 55.00
             else:
@@ -343,12 +374,20 @@ class MLService:
                 final_risk = min(final_risk, 18.0)
             raw_anomaly_score = max(raw_anomaly_score, 0.050)
 
-        # Rule Override 2: High-Severity Threats (BRUTE_FORCE, failed_count >= 10, burst > 10, SQL/XSS) must be Anomalous
+        # Rule Override 2: High-Severity Threats must be Anomalous
         elif (
-            event_type_upper in ["BRUTE_FORCE", "CLOUD_BRUTE_FORCE", "UNAUTHORIZED_API_CALL"]
+            event_type_upper in [
+                "BRUTE_FORCE", "CLOUD_BRUTE_FORCE", "UNAUTHORIZED_API_CALL",
+                # New attack event types — always Anomalous
+                "PORT_SCAN", "DATA_EXFILTRATION", "SQL_INJECTION_ATTEMPT",
+                "PATH_TRAVERSAL_ATTEMPT", "AUDIT_LOG_TAMPERING",
+                "CLOUD_CONFIG_CHANGE", "CLOUD_IAM_CHANGE", "CLOUD_FIREWALL_CHANGE",
+                "CREDENTIAL_STUFFING",
+            ]
             or features.get("failed_attempts", 0.0) >= 10.0
             or features.get("transfer_burst_rate", 0.0) > 10.0
-            or features.get("endpoint_risk_depth", 0.0) >= 0.9
+            or features.get("endpoint_risk_depth", 0.0) >= 0.7   # Lowered from 0.9 → catches path traversal
+            or features.get("action_destructiveness", 0.0) >= 0.8  # Added — catches audit tampering, cloud changes
         ):
             prediction = -1
             threat = "Anomalous"
