@@ -40,3 +40,11 @@ env/
 # Testing & Coverage
 coverage/
 .pytest_cache/
+
+# SQLite database files (never commit live DB data)
+*.db
+*.db-shm
+*.db-wal
+
+# Trained ML model binaries (large binary, regenerate via ml/train.py)
+*.pkl
